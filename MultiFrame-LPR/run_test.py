@@ -16,7 +16,7 @@ from src.utils.common import seed_everything
 def run_inference():
     # 1. CẤU HÌNH (SETUP)
     # ---------------------------------------------------------
-    TEST_DATA_PATH = "data/Pa7a3Hin-test-public"  # <-- Đường dẫn folder test của bạn
+    TEST_DATA_PATH = "data/TKzFBtn7-test-blind/TKzFBtn7-test-blind"  # <-- Đường dẫn folder test của bạn
     CHECKPOINT_PATH = "results/restran_best.pth"   # <-- Đường dẫn model best
     OUTPUT_FILE = "results/submission_final.txt"   # File kết quả
     # ---------------------------------------------------------
