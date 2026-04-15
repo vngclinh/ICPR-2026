@@ -4,7 +4,7 @@ import json
 import os
 import random
 from typing import Any, Dict, List, Tuple
-
+import numpy as np
 import cv2
 import torch
 from torch.utils.data import Dataset
@@ -188,18 +188,25 @@ class MultiFrameDataset(Dataset):
                     glob.glob(os.path.join(track_path, "hr-*.jpg"))
                 )
                 
-                # --- THAY ĐỔI Ở ĐÂY ---
-                # Thay vì append 2 lần, ta chỉ append 1 lần chứa cả 2 loại đường dẫn
+                # Real LR samples
                 self.samples.append({
-                    'lr_paths': lr_files,  # Lưu đường dẫn LR
-                    'hr_paths': hr_files,  # Lưu đường dẫn HR (có thể rỗng nếu không có)
+                    'paths': lr_files,
                     'label': label,
+                    'is_synthetic': False,
                     'track_id': track_id
                 })
-                # ---------------------
-
+                
+                # Synthetic LR samples (only in training mode)
+                if self.mode == 'train':
+                    self.samples.append({
+                        'paths': hr_files,
+                        'label': label,
+                        'is_synthetic': True,
+                        'track_id': track_id
+                    })
             except Exception:
                 pass
+
     def _index_test_samples(self, tracks: List[str]) -> None:
         """Index test samples without labels."""
         for track_path in tqdm(tracks, desc="Indexing test"):
@@ -213,9 +220,9 @@ class MultiFrameDataset(Dataset):
             
             if lr_files:
                 self.samples.append({
-                    'lr_paths': lr_files,   # Đổi tên key từ 'paths' thành 'lr_paths'
-                    'hr_paths': [],         # Thêm hr_paths rỗng để code không bị lỗi
-                    'label': '',            # No label for test data
+                    'paths': lr_files,
+                    'label': '',  # No label for test data
+                    'is_synthetic': False,
                     'track_id': track_id
                 })
 
@@ -223,72 +230,90 @@ class MultiFrameDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int, str, str]:
+        """Load exactly 5 frames (guaranteed by dataset structure).
+        
+        For training: applies degradation (if synthetic) then augmentation.
+        For validation: applies degradation (if synthetic) then clean transform.
+        For test: only applies clean transform, returns dummy targets.
+        """
         item = self.samples[idx]
-        
-        # -----------------------------------------------------------
-        # BƯỚC 1: QUYẾT ĐỊNH CHỌN ẢNH THẬT (LR) HAY GIẢ (HR)
-        # -----------------------------------------------------------
-        img_paths = item['lr_paths']
-        is_synthetic = False
-
-        # Logic Random 50/50: Chỉ áp dụng khi Train VÀ có ảnh HR
-        if self.mode == 'train' and len(item['hr_paths']) > 0:
-            if random.random() > 0.5: 
-                img_paths = item['hr_paths']
-                is_synthetic = True
-        
-        # -----------------------------------------------------------
-        # BƯỚC 2: PADDING / TRUNCATE ĐỂ ĐẢM BẢO LUÔN ĐỦ 5 FRAMES
-        # (Phải làm bước này SAU khi đã chọn được list ảnh cuối cùng)
-        # -----------------------------------------------------------
+        img_paths = item['paths']
+# --- THÊM ĐOẠN CODE NÀY ĐỂ ÉP ĐÚNG 5 FRAMES ---
         required_frames = 5
         if len(img_paths) < required_frames:
-            # Nếu thiếu: Lặp lại frame cuối cùng cho đủ
-            padding_count = required_frames - len(img_paths)
+            # Nếu thiếu: copy ảnh cuối cùng lấp vào cho đủ
             if len(img_paths) > 0:
-                img_paths = img_paths + [img_paths[-1]] * padding_count
+                img_paths = img_paths + [img_paths[-1]] * (required_frames - len(img_paths))
             else:
-                # Trường hợp cực đoan: track rỗng (không có ảnh nào)
-                # Xử lý tạm: dùng đường dẫn 'dummy' để tạo ảnh đen ở bước sau
-                img_paths = ["dummy_path.jpg"] * required_frames
+                img_paths = ["dummy.jpg"] * required_frames # Đề phòng thư mục rỗng
         else:
-            # Nếu thừa: Chỉ lấy 5 frame đầu
+            # Nếu thừa: Cắt bỏ chỉ lấy 5 ảnh đầu
             img_paths = img_paths[:required_frames]
+        # ----------------------------------------------
 
-        # -----------------------------------------------------------
-        # BƯỚC 3: LOAD ẢNH VÀ XỬ LÝ (DEGRADE + TRANSFORM)
-        # -----------------------------------------------------------
         label = item['label']
+        is_synthetic = item['is_synthetic']
         track_id = item['track_id']
         
+        # 1. Load và Degrade tất cả ảnh trước
         images_list = []
+        max_h, max_w = 0, 0  # Khởi tạo biến tìm kích thước lớn nhất
+        
         for p in img_paths:
-            # 3.1 Load ảnh
             image = cv2.imread(p, cv2.IMREAD_COLOR)
-            
-            # 3.2 Xử lý ảnh lỗi / không đọc được (hoặc dummy path)
+            # Xử lý nếu đường dẫn hỏng hoặc thư mục rỗng
             if image is None:
                 image = np.zeros((self.img_height, self.img_width, 3), dtype=np.uint8)
             else:
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
-            # 3.3 Làm xấu ảnh (Degradation) - Chỉ cho HR Synthetic
+                
             if is_synthetic and self.degrade:
                 image = self.degrade(image=image)['image']
-            
-            # 3.4 Augmentation / Normalize
-            image = self.transform(image=image)['image']
+                
+            # Cập nhật max_h và max_w
+            h, w = image.shape[:2]
+            max_h, max_w = max(max_h, h), max(max_w, w)
             
             images_list.append(image)
 
-        # Xếp chồng thành Tensor [5, 3, H, W]
-        images_tensor = torch.stack(images_list, dim=0)
+        # --- BƯỚC CHỮA CHÁY: Đệm (Padding) để 5 ảnh to bằng nhau ---
+        padded_images = []
+        for img in images_list:
+            h, w = img.shape[:2]
+            if h != max_h or w != max_w:
+                # Đệm thêm vào lề dưới và lề phải bằng cách nhân bản pixel viền
+                img = cv2.copyMakeBorder(img, 0, max_h - h, 0, max_w - w, cv2.BORDER_REPLICATE)
+            padded_images.append(img)
+        # -----------------------------------------------------------
+
+        # 2. Đưa cả 5 ảnh vào Transform CÙNG 1 LÚC để giữ tính nhất quán
+        transform_kwargs = {
+            'image': padded_images[0], 
+            'image1': padded_images[1],
+            'image2': padded_images[2], 
+            'image3': padded_images[3], 
+            'image4': padded_images[4]
+        }
         
-        # -----------------------------------------------------------
-        # BƯỚC 4: XỬ LÝ NHÃN (LABEL)
-        # -----------------------------------------------------------
+        transformed = self.transform(**transform_kwargs)
+        
+        final_tensors = [
+            transformed['image'], transformed['image1'],
+            transformed['image2'], transformed['image3'], transformed['image4']
+        ]
+        
+        images_tensor = torch.stack(final_tensors, dim=0)
+        
+        final_tensors = [
+            transformed['image'], transformed['image1'],
+            transformed['image2'], transformed['image3'], transformed['image4']
+        ]
+        
+        images_tensor = torch.stack(final_tensors, dim=0)
+        
+        # Handle test mode (no labels)
         if self.is_test:
-            target = [0]
+            target = [0]  # Dummy target
             target_len = 1
         else:
             target = [self.char2idx[c] for c in label if c in self.char2idx]
@@ -297,6 +322,7 @@ class MultiFrameDataset(Dataset):
             target_len = len(target)
             
         return images_tensor, torch.tensor(target, dtype=torch.long), target_len, label, track_id
+
     @staticmethod
     def collate_fn(batch: List[Tuple]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[str, ...], Tuple[str, ...]]:
         """Custom collate function for DataLoader."""

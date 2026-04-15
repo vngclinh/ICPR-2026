@@ -259,12 +259,13 @@ def main():
             rnn_dropout=config.RNN_DROPOUT,
             use_stn=config.USE_STN,
         ).to(config.DEVICE)
-    checkpoint_path = "results/restran_best.pth"
+    checkpoint_path = os.path.join(config.OUTPUT_DIR, f"{config.EXPERIMENT_NAME}_best.pth")
     if os.path.exists(checkpoint_path):
         print(f"🔄 Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path)
-        # Nếu file pth chỉ lưu state_dict (thường là vậy trong code Trainer của bạn)
+        checkpoint = torch.load(checkpoint_path, map_location=config.DEVICE)
         model.load_state_dict(checkpoint)
+    else:
+        print("✨ Starting training from scratch.")
     # Print model summary
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

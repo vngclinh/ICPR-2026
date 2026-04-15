@@ -32,7 +32,6 @@ class STNBlock(nn.Module):
             nn.ReLU(True),
             nn.Linear(128, 6)
         )
-        
         # Initialize the weights/bias with identity transformation
         self.fc_loc[-1].weight.data.zero_()
         self.fc_loc[-1].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
