@@ -13,11 +13,13 @@ class Config:
     EXPERIMENT_NAME: str = MODEL_TYPE
     AUGMENTATION_LEVEL: str = "full"  # "full" or "light"
     USE_STN: bool = True  # Enable Spatial Transformer Network
+    USE_PRETRAINED: bool = True  # Use ImageNet pretrained backbone for restran
     
     # Data paths
-    DATA_ROOT: str = "data/train"
-    TEST_DATA_ROOT: str = "data/public_test"
-    VAL_SPLIT_FILE: str = "data/val_tracks.json"
+    DATASET_ROOT: str = "data/LRLPR-26-5opEvJTW"
+    DATA_ROOT: str = "data/LRLPR-26-5opEvJTW/train"
+    TEST_DATA_ROOT: str = "data/LRLPR-26-5opEvJTW/test"
+    VAL_SPLIT_FILE: str = "data/LRLPR-26-5opEvJTW/val_tracks.json"
     SUBMISSION_FILE: str = "submission.txt"
     
     IMG_HEIGHT: int = 32
@@ -28,10 +30,10 @@ class Config:
     
     # Training hyperparameters
     BATCH_SIZE: int = 64
-    LEARNING_RATE: float = 5e-4
-    EPOCHS: int = 30
+    LEARNING_RATE: float = 2e-4
+    EPOCHS: int = 20
     SEED: int = 42
-    NUM_WORKERS: int = 10
+    NUM_WORKERS: int = 4
     WEIGHT_DECAY: float = 1e-4
     GRAD_CLIP: float = 5.0
     SPLIT_RATIO: float = 0.9

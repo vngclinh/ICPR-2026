@@ -17,11 +17,14 @@ uv sync
 # Train with default settings (ResTranOCR + STN)
 python train.py
 
+# Verify dataset/model wiring without training
+python train.py --dry-run --batch-size 2 --num-workers 0
+
 # Train CRNN baseline
 python train.py --model crnn --experiment-name crnn_baseline
 
-# Generate submission file
-python train.py --submission-mode --model restran
+# Train with train/val split and evaluate released labelled test
+python train.py --model restran
 ```
 
 ---
@@ -31,7 +34,7 @@ python train.py --submission-mode --model restran
 - **Multi-Frame Fusion**: Processes 5-frame sequences with attention-based fusion
 - **Spatial Transformer Network**: Optional STN module for automatic image alignment
 - **Dual Architectures**: CRNN (baseline) and ResTranOCR (ResNet34 + Transformer)
-- **Smart Data Augmentation**: Scenario-B aware validation split with configurable augmentation levels
+- **Smart Data Augmentation**: reproducible train/val split with configurable augmentation levels
 - **Production Ready**: Mixed precision training, gradient clipping, OneCycleLR scheduler
 
 ---
@@ -77,10 +80,19 @@ pip install albumentations opencv-python matplotlib numpy pandas tqdm
 
 ### Data Preparation
 
+Default paths target the released dataset:
+
+```text
+data/LRLPR-26-5opEvJTW/train
+data/LRLPR-26-5opEvJTW/test
+```
+
+`train.py` splits the released `train` folder into train/val and evaluates the labelled released `test` folder after training.
+
 Organize your dataset with the following structure:
 
 ```
-data/train/
+data/LRLPR-26-5opEvJTW/train/
 ├── track_001/
 │   ├── lr-001.png
 │   ├── lr-002.png
@@ -123,13 +135,13 @@ python train.py --no-stn
 **Key arguments:**
 - `-m, --model`: Model type (`crnn` or `restran`)
 - `-n, --experiment-name`: Experiment identifier
-- `--data-root`: Path to training data (default: `data/train`)
+- `--data-root`: Path to training data (default: `data/LRLPR-26-5opEvJTW/train`)
 - `--batch-size`: Batch size (default: 64)
 - `--epochs`: Training epochs (default: 30)
 - `--lr`: Learning rate (default: 5e-4)
 - `--aug-level`: Augmentation level (`full` or `light`)
 - `--no-stn`: Disable Spatial Transformer Network
-- `--submission-mode`: Train on full dataset and generate test predictions
+- `--submission-mode`: Train on the full released train split and run test inference/evaluation
 - `--output-dir`: Output directory (default: `results/`)
 
 ### Ablation Studies
@@ -152,6 +164,7 @@ After training, the following files are generated in the output directory:
 
 - `{experiment_name}_best.pth` - Best model checkpoint
 - `submission_{experiment_name}.txt` - Predictions in competition format: `track_id,predicted_text;confidence`
+- `test_predictions_{experiment_name}.csv` - Released test predictions with ground truth, confidence, and correctness
 
 ---
 
@@ -216,4 +229,4 @@ Dynamically computes attention weights across temporal frames and fuses multi-fr
 ### Data Augmentation
 - **Full mode**: Affine transforms, perspective warping, HSV adjustment, coarse dropout
 - **Light mode**: Resize and normalize only
-- **Scenario-B aware splitting**: Validation set prioritizes challenging scenarios to prevent overfitting
+- **Released split support**: Validation is sampled reproducibly from the released `train` folder and `test` is evaluated separately

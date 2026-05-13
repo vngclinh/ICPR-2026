@@ -1,4 +1,8 @@
 """Augmentation pipelines for training, validation, and degradation."""
+import os
+
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -21,14 +25,14 @@ def get_train_transforms(img_height: int = 32, img_width: int = 128) -> A.Compos
         # Dialed way down to protect thin characters like "1" or "7"
         A.CoarseDropout(num_holes_range=(1, 2), hole_height_range=(2, 4), hole_width_range=(2, 4), fill=128, p=0.1),
         
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2()
     ], additional_targets=SEQUENCE_TARGETS)
 
 def get_light_transforms(img_height: int = 32, img_width: int = 128) -> A.Compose:
     return A.Compose([
         A.Resize(height=img_height, width=img_width),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
     ], additional_targets=SEQUENCE_TARGETS)
 
@@ -40,7 +44,7 @@ def get_degradation_transforms() -> A.Compose:
             A.MotionBlur(blur_limit=(3, 7), p=1.0)
         ], p=0.7),
         A.OneOf([
-            A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+            A.GaussNoise(std_range=(0.01, 0.03), mean_range=(0.0, 0.0), p=1.0),
             A.MultiplicativeNoise(multiplier=(0.9, 1.1), p=1.0)
         ], p=0.7),
         A.ImageCompression(quality_range=(20, 60), p=0.5),
@@ -50,6 +54,6 @@ def get_degradation_transforms() -> A.Compose:
 def get_val_transforms(img_height: int = 32, img_width: int = 128) -> A.Compose:
     return A.Compose([
         A.Resize(height=img_height, width=img_width),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2()
     ], additional_targets=SEQUENCE_TARGETS)

@@ -16,18 +16,19 @@ class ResTranOCR(nn.Module):
         transformer_layers: int = 3,
         transformer_ff_dim: int = 2048,
         dropout: float = 0.1,
-        use_stn: bool = True
+        use_stn: bool = True,
+        pretrained: bool = True,
     ):
         super().__init__()
         self.cnn_channels = 512
         self.use_stn = use_stn
-        
+
         # 1. Spatial Transformer Network
         if self.use_stn:
             self.stn = STNBlock(in_channels=3)
 
         # 2. Backbone: ResNet34
-        self.backbone = ResNetFeatureExtractor(pretrained=False)
+        self.backbone = ResNetFeatureExtractor(pretrained=pretrained)
         
         # 3. Attention Fusion
         self.fusion = AttentionFusion(channels=self.cnn_channels)

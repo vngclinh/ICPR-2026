@@ -1,122 +1,255 @@
+#!/usr/bin/env python3
+"""Evaluate a trained checkpoint on the released ICPR 2026 LRLPR test split."""
+
+import argparse
+import csv
 import os
 import sys
+from typing import Dict, List, Tuple
+
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Thêm đường dẫn để import được các module trong src/
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from configs.config import Config
 from src.data.dataset import MultiFrameDataset
+from src.models.crnn import MultiFrameCRNN
 from src.models.restran import ResTranOCR
-from src.utils.postprocess import decode_with_confidence
 from src.utils.common import seed_everything
+from src.utils.postprocess import decode_with_confidence
 
-def run_inference():
-    # 1. CẤU HÌNH (SETUP)
-    # ---------------------------------------------------------
-    TEST_DATA_PATH = "data/TKzFBtn7-test-blind/TKzFBtn7-test-blind"  # <-- Đường dẫn folder test của bạn
-    CHECKPOINT_PATH = "results/restran_best.pth"   # <-- Đường dẫn model best
-    OUTPUT_FILE = "results/submission_final.txt"   # File kết quả
-    # ---------------------------------------------------------
 
-    # Load config mặc định để lấy tham số model (img size, vocab, etc.)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run test evaluation/inference")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="results/restran_best.pth",
+        help="Path to a saved model state_dict",
+    )
+    parser.add_argument(
+        "--test-data-root",
+        type=str,
+        default=None,
+        help="Path to released test split",
+    )
+    parser.add_argument(
+        "-m", "--model",
+        type=str,
+        choices=["crnn", "restran"],
+        default=None,
+        help="Model architecture used by the checkpoint",
+    )
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--no-stn", action="store_true", help="Disable STN alignment")
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        default=None,
+        help="CSV output for labelled test or TXT output for unlabeled test",
+    )
+    return parser.parse_args()
+
+
+def edit_distance(source: str, target: str) -> int:
+    if source == target:
+        return 0
+    if not source:
+        return len(target)
+    if not target:
+        return len(source)
+
+    previous = list(range(len(target) + 1))
+    for i, source_char in enumerate(source, start=1):
+        current = [i]
+        for j, target_char in enumerate(target, start=1):
+            insert_cost = current[j - 1] + 1
+            delete_cost = previous[j] + 1
+            replace_cost = previous[j - 1] + (source_char != target_char)
+            current.append(min(insert_cost, delete_cost, replace_cost))
+        previous = current
+    return previous[-1]
+
+
+def build_model(config: Config) -> torch.nn.Module:
+    if config.MODEL_TYPE == "restran":
+        return ResTranOCR(
+            num_classes=config.NUM_CLASSES,
+            transformer_heads=config.TRANSFORMER_HEADS,
+            transformer_layers=config.TRANSFORMER_LAYERS,
+            transformer_ff_dim=config.TRANSFORMER_FF_DIM,
+            dropout=config.TRANSFORMER_DROPOUT,
+            use_stn=config.USE_STN,
+        ).to(config.DEVICE)
+
+    return MultiFrameCRNN(
+        num_classes=config.NUM_CLASSES,
+        hidden_size=config.HIDDEN_SIZE,
+        rnn_dropout=config.RNN_DROPOUT,
+        use_stn=config.USE_STN,
+    ).to(config.DEVICE)
+
+
+def build_dataset(config: Config) -> Tuple[MultiFrameDataset, bool]:
+    common = {
+        "img_height": config.IMG_HEIGHT,
+        "img_width": config.IMG_WIDTH,
+        "char2idx": config.CHAR2IDX,
+        "seed": config.SEED,
+    }
+    labelled_ds = MultiFrameDataset(
+        root_dir=config.TEST_DATA_ROOT,
+        mode="test",
+        is_test=False,
+        **common,
+    )
+    if len(labelled_ds) > 0:
+        return labelled_ds, True
+
+    unlabeled_ds = MultiFrameDataset(
+        root_dir=config.TEST_DATA_ROOT,
+        mode="test",
+        is_test=True,
+        **common,
+    )
+    return unlabeled_ds, False
+
+
+def evaluate_labelled(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    config: Config,
+    output_file: str,
+) -> Dict[str, float]:
+    criterion = nn.CTCLoss(blank=0, zero_infinity=True, reduction="mean")
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    total_edits = 0
+    total_chars = 0
+    rows: List[Tuple[str, str, float, str, bool]] = []
+
+    model.eval()
+    with torch.no_grad():
+        for images, targets, target_lengths, labels_text, track_ids in tqdm(loader, desc="Testing"):
+            images = images.to(config.DEVICE)
+            targets = targets.to(config.DEVICE)
+            preds = model(images)
+            input_lengths = torch.full((images.size(0),), preds.size(1), dtype=torch.long)
+            loss = criterion(preds.permute(1, 0, 2), targets, input_lengths, target_lengths)
+            total_loss += loss.item()
+
+            decoded_list = decode_with_confidence(preds, config.IDX2CHAR)
+            for i, (pred_text, conf) in enumerate(decoded_list):
+                gt_text = labels_text[i]
+                track_id = track_ids[i]
+                correct = pred_text == gt_text
+                total_correct += int(correct)
+                total_edits += edit_distance(pred_text, gt_text)
+                total_chars += len(gt_text)
+                total_samples += 1
+                rows.append((track_id, pred_text, conf, gt_text, correct))
+
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["track_id", "prediction", "confidence", "ground_truth", "correct"])
+        for track_id, pred_text, conf, gt_text, correct in rows:
+            writer.writerow([track_id, pred_text, f"{conf:.4f}", gt_text, int(correct)])
+
+    metrics = {
+        "loss": total_loss / len(loader) if len(loader) else 0.0,
+        "acc": (total_correct / total_samples) * 100 if total_samples else 0.0,
+        "cer": (total_edits / total_chars) * 100 if total_chars else 0.0,
+    }
+    return metrics
+
+
+def predict_unlabelled(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    config: Config,
+    output_file: str,
+) -> None:
+    results: List[str] = []
+    model.eval()
+    with torch.no_grad():
+        for images, _, _, _, track_ids in tqdm(loader, desc="Inferencing"):
+            images = images.to(config.DEVICE)
+            preds = model(images)
+            decoded_list = decode_with_confidence(preds, config.IDX2CHAR)
+            for i, (pred_text, conf) in enumerate(decoded_list):
+                results.append(f"{track_ids[i]},{pred_text};{conf:.4f}")
+
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(results))
+
+
+def main() -> None:
+    args = parse_args()
     config = Config()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.model is not None:
+        config.MODEL_TYPE = args.model
+    if args.test_data_root is not None:
+        config.TEST_DATA_ROOT = args.test_data_root
+    if args.batch_size is not None:
+        config.BATCH_SIZE = args.batch_size
+    if args.num_workers is not None:
+        config.NUM_WORKERS = args.num_workers
+    if args.no_stn:
+        config.USE_STN = False
+
     seed_everything(config.SEED)
 
-    print(f"🚀 START INFERENCE")
-    print(f"• Data: {TEST_DATA_PATH}")
-    print(f"• Model: {CHECKPOINT_PATH}")
-    print(f"• Device: {device}")
+    if not os.path.exists(config.TEST_DATA_ROOT):
+        print(f"ERROR: Test data root not found: {config.TEST_DATA_ROOT}")
+        sys.exit(1)
+    if not os.path.exists(args.checkpoint):
+        print(f"ERROR: Checkpoint not found: {args.checkpoint}")
+        sys.exit(1)
 
-    # 2. CHUẨN BỊ DỮ LIỆU (DATA LOADER)
-    # ---------------------------------------------------------
-    if not os.path.exists(TEST_DATA_PATH):
-        print(f"❌ Error: Không tìm thấy folder data tại {TEST_DATA_PATH}")
-        return
+    print("Test configuration:")
+    print(f"   DATA: {config.TEST_DATA_ROOT}")
+    print(f"   MODEL: {config.MODEL_TYPE}")
+    print(f"   CHECKPOINT: {args.checkpoint}")
+    print(f"   DEVICE: {config.DEVICE}")
 
-    test_dataset = MultiFrameDataset(
-        root_dir=TEST_DATA_PATH,
-        mode='val',         # Mode val để tắt augmentation
-        img_height=config.IMG_HEIGHT,
-        img_width=config.IMG_WIDTH,
-        char2idx=config.CHAR2IDX,
-        is_test=True        # Quan trọng: Báo là test data (không có label)
-    )
+    dataset, is_labelled = build_dataset(config)
+    if len(dataset) == 0:
+        print("ERROR: Test dataset is empty.")
+        sys.exit(1)
 
-    if len(test_dataset) == 0:
-        print("❌ Error: Không tìm thấy ảnh nào trong folder test.")
-        return
-
-    test_loader = DataLoader(
-        test_dataset,
+    loader = DataLoader(
+        dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
         collate_fn=MultiFrameDataset.collate_fn,
         num_workers=config.NUM_WORKERS,
-        pin_memory=True
+        pin_memory=config.DEVICE.type == "cuda",
     )
-    print(f"✅ Loaded {len(test_dataset)} samples.")
 
-    # 3. KHỞI TẠO MODEL & LOAD WEIGHT
-    # ---------------------------------------------------------
-    model = ResTranOCR(
-        num_classes=config.NUM_CLASSES,
-        transformer_heads=config.TRANSFORMER_HEADS,
-        transformer_layers=config.TRANSFORMER_LAYERS,
-        transformer_ff_dim=config.TRANSFORMER_FF_DIM,
-        dropout=config.TRANSFORMER_DROPOUT,
-        use_stn=config.USE_STN
-    ).to(device)
+    model = build_model(config)
+    model.load_state_dict(torch.load(args.checkpoint, map_location=config.DEVICE))
+    print("Weights loaded.")
 
-    if not os.path.exists(CHECKPOINT_PATH):
-        print(f"❌ Error: Không tìm thấy file weight tại {CHECKPOINT_PATH}")
-        return
+    if is_labelled:
+        output_file = args.output_file or f"results/test_predictions_{config.MODEL_TYPE}.csv"
+        metrics = evaluate_labelled(model, loader, config, output_file)
+        print(
+            f"Test Results: Loss: {metrics['loss']:.4f} | "
+            f"Acc: {metrics['acc']:.2f}% | CER: {metrics['cer']:.2f}%"
+        )
+        print(f"Saved labelled predictions to {output_file}")
+    else:
+        output_file = args.output_file or "results/submission_final.txt"
+        predict_unlabelled(model, loader, config, output_file)
+        print(f"Saved predictions to {output_file}")
 
-    # Load state dict
-    try:
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
-        model.load_state_dict(checkpoint)
-        print("✅ Weights loaded successfully.")
-    except Exception as e:
-        print(f"❌ Error loading weights: {e}")
-        return
-
-    # 4. CHẠY DỰ ĐOÁN (INFERENCE LOOP)
-    # ---------------------------------------------------------
-    model.eval()
-    results = []
-    
-    # Mapping từ index số sang ký tự
-    idx2char = config.IDX2CHAR
-
-    print("🔮 Running prediction...")
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Inferencing"):
-            # Unpack batch (chú ý: MultiFrameDataset trả về 5 giá trị)
-            images, _, _, _, track_ids = batch
-            images = images.to(device)
-
-            # Forward pass
-            preds = model(images)  # Output: [Batch, Seq_Len, Classes]
-
-            # Decode kết quả
-            decoded_list = decode_with_confidence(preds, idx2char)
-
-            # Lưu kết quả
-            for i, (pred_text, conf) in enumerate(decoded_list):
-                track_id = track_ids[i]
-                results.append(f"{track_id},{pred_text};{conf:.4f}")
-
-    # 5. LƯU FILE KẾT QUẢ
-    # ---------------------------------------------------------
-    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-    with open(OUTPUT_FILE, 'w') as f:
-        f.write("\n".join(results))
-    
-    print(f"\n🎉 DONE! Saved {len(results)} results to: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
-    run_inference()
+    main()
