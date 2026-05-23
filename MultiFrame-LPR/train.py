@@ -19,6 +19,17 @@ from src.training.trainer import Trainer
 from src.utils.common import seed_everything
 
 
+def parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "t", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "f", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train Multi-Frame OCR for the released ICPR 2026 LRLPR dataset"
@@ -73,6 +84,55 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-stn", action="store_true", help="Disable STN alignment")
     parser.add_argument(
+        "--use_sr", "--use-sr",
+        dest="use_sr",
+        nargs="?",
+        const=True,
+        type=parse_bool,
+        default=None,
+        help="Enable the RRDB super-resolution frontend (default: from config; true)",
+    )
+    parser.add_argument("--no-sr", action="store_true", help="Disable the SR frontend")
+    parser.add_argument(
+        "--lambda_sr", "--lambda-sr",
+        dest="lambda_sr",
+        type=float, default=None,
+        help="Weight for the SR L1 reconstruction loss (default: 0.1)",
+    )
+    parser.add_argument(
+        "--sr-lr",
+        dest="sr_lr",
+        type=float, default=None,
+        help="Separate learning rate for the SR module. When set, --lr applies only to OCR "
+             "and the SR module trains at this (typically higher) rate. Example: --lr 1e-5 --sr-lr 2e-4",
+    )
+    parser.add_argument(
+        "--sr-freeze-epochs", type=int, default=None,
+        help="Number of initial epochs to keep the SR module frozen",
+    )
+    parser.add_argument(
+        "--ocr-freeze-epochs", type=int, default=None,
+        help="Number of initial epochs to freeze all OCR params (SR-only training phase)",
+    )
+    parser.add_argument(
+        "--sr-feed-hr",
+        action="store_true",
+        help="Feed the 2x SR output directly to STN/ResNet instead of downsampling.",
+    )
+    parser.add_argument(
+        "--sr-blend",
+        dest="sr_blend",
+        type=float,
+        default=None,
+        help="Blend factor for SR OCR input: 0 uses original LR, 1 uses full SR output.",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint to initialize from when the experiment checkpoint does not exist.",
+    )
+    parser.add_argument(
         "--no-test-eval",
         action="store_true",
         help="Skip labelled test evaluation after training",
@@ -86,6 +146,13 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Build datasets/model and run one forward pass, then exit",
+    )
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        choices=["onecycle", "cosine"],
+        default=None,
+        help="LR scheduler: 'onecycle' (default, with warmup) or 'cosine' (no warmup, starts at --lr)",
     )
     return parser.parse_args()
 
@@ -119,6 +186,24 @@ def apply_cli_overrides(config: Config, args: argparse.Namespace) -> None:
         config.EXPERIMENT_NAME = config.MODEL_TYPE
     if args.no_stn:
         config.USE_STN = False
+    if args.use_sr is not None:
+        config.USE_SR = bool(args.use_sr)
+    if args.no_sr:
+        config.USE_SR = False
+    if args.lambda_sr is not None:
+        config.LAMBDA_SR = args.lambda_sr
+    if args.sr_freeze_epochs is not None:
+        config.SR_FREEZE_EPOCHS = args.sr_freeze_epochs
+    if getattr(args, "ocr_freeze_epochs", None) is not None:
+        config.OCR_FREEZE_EPOCHS = args.ocr_freeze_epochs
+    if getattr(args, "sr_lr", None) is not None:
+        config.SR_LR = args.sr_lr
+    if args.sr_feed_hr:
+        config.SR_FEED_HR = True
+    if getattr(args, "sr_blend", None) is not None:
+        config.SR_BLEND = args.sr_blend
+    if getattr(args, "scheduler", None) is not None:
+        config.SCHEDULER = args.scheduler
     config.OUTPUT_DIR = args.output_dir
 
 
@@ -148,6 +233,13 @@ def build_model(config: Config) -> torch.nn.Module:
             dropout=config.TRANSFORMER_DROPOUT,
             use_stn=config.USE_STN,
             pretrained=getattr(config, "USE_PRETRAINED", True),
+            use_sr=getattr(config, "USE_SR", False),
+            sr_num_blocks=getattr(config, "SR_NUM_BLOCKS", 8),
+            sr_scale=getattr(config, "SR_SCALE", 2),
+            sr_nf=getattr(config, "SR_NF", 32),
+            sr_gc=getattr(config, "SR_GC", 16),
+            sr_feed_hr=getattr(config, "SR_FEED_HR", False),
+            sr_blend=getattr(config, "SR_BLEND", 1.0),
         ).to(config.DEVICE)
 
     return MultiFrameCRNN(
@@ -196,6 +288,12 @@ def print_config(config: Config, submission_mode: bool, dry_run: bool) -> None:
     print(f"   EXPERIMENT: {config.EXPERIMENT_NAME}")
     print(f"   MODEL: {config.MODEL_TYPE}")
     print(f"   USE_STN: {config.USE_STN}")
+    sr_lr_str = f" | sr_lr={getattr(config, 'SR_LR', None)}" if getattr(config, 'SR_LR', None) else ""
+    print(f"   USE_SR: {getattr(config, 'USE_SR', False)} | "
+          f"lambda_sr={getattr(config, 'LAMBDA_SR', 0.0)} | "
+          f"freeze_epochs={getattr(config, 'SR_FREEZE_EPOCHS', 0)} | "
+          f"feed_hr={getattr(config, 'SR_FEED_HR', False)} | "
+          f"blend={getattr(config, 'SR_BLEND', 1.0)}{sr_lr_str}")
     print(f"   DATA_ROOT: {config.DATA_ROOT}")
     print(f"   TEST_DATA_ROOT: {config.TEST_DATA_ROOT}")
     print(f"   VAL_SPLIT_FILE: {config.VAL_SPLIT_FILE}")
@@ -209,17 +307,23 @@ def print_config(config: Config, submission_mode: bool, dry_run: bool) -> None:
 
 
 def run_dry_check(model: torch.nn.Module, train_loader: DataLoader, config: Config) -> None:
-    images, targets, target_lengths, labels_text, track_ids = next(iter(train_loader))
+    batch = next(iter(train_loader))
+    images, targets, target_lengths, labels_text, track_ids, hr_frames, has_hr = batch
     print("Dry run batch:")
     print(f"   images: {tuple(images.shape)}")
     print(f"   targets: {tuple(targets.shape)}")
     print(f"   target_lengths: {target_lengths.tolist()[:8]}")
     print(f"   first_label: {labels_text[0]}")
     print(f"   first_track: {track_ids[0]}")
+    print(f"   hr_frames: {tuple(hr_frames.shape)} | has_hr: {has_hr.tolist()[:8]}")
 
     model.eval()
     with torch.no_grad():
-        preds = model(images.to(config.DEVICE))
+        if getattr(model, "use_sr", False):
+            preds, sr_out = model(images.to(config.DEVICE), return_sr=True)
+            print(f"   sr_output: {tuple(sr_out.shape)}")
+        else:
+            preds = model(images.to(config.DEVICE))
     print(f"   model_output: {tuple(preds.shape)}")
     print("Dry run OK.")
 
@@ -240,6 +344,7 @@ def main() -> None:
         print("ERROR: --epochs must be >= 1 unless --dry-run is used.")
         sys.exit(1)
 
+    load_hr = config.MODEL_TYPE == "restran" and bool(getattr(config, "USE_SR", False))
     common_ds_params = {
         "split_ratio": config.SPLIT_RATIO,
         "img_height": config.IMG_HEIGHT,
@@ -248,6 +353,9 @@ def main() -> None:
         "val_split_file": config.VAL_SPLIT_FILE,
         "seed": config.SEED,
         "augmentation_level": config.AUGMENTATION_LEVEL,
+        "load_hr": load_hr,
+        "hr_height": getattr(config, "HR_HEIGHT", 64),
+        "hr_width": getattr(config, "HR_WIDTH", 256),
     }
 
     train_ds = MultiFrameDataset(
@@ -284,7 +392,23 @@ def main() -> None:
     checkpoint_path = os.path.join(config.OUTPUT_DIR, f"{config.EXPERIMENT_NAME}_best.pth")
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint: {checkpoint_path}")
-        model.load_state_dict(torch.load(checkpoint_path, map_location=config.DEVICE))
+        state_dict = torch.load(checkpoint_path, map_location=config.DEVICE)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"  Missing keys (will be initialized fresh): {len(missing)}")
+        if unexpected:
+            print(f"  Unexpected keys (ignored): {len(unexpected)}")
+    elif args.init_checkpoint:
+        if not os.path.exists(args.init_checkpoint):
+            print(f"ERROR: init checkpoint not found: {args.init_checkpoint}")
+            sys.exit(1)
+        print(f"Initializing from checkpoint: {args.init_checkpoint}")
+        state_dict = torch.load(args.init_checkpoint, map_location=config.DEVICE)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"  Missing keys (will be initialized fresh): {len(missing)}")
+        if unexpected:
+            print(f"  Unexpected keys (ignored): {len(unexpected)}")
     else:
         print("Starting training from scratch.")
 
@@ -308,7 +432,9 @@ def main() -> None:
     best_model_path = os.path.join(config.OUTPUT_DIR, f"{exp_name}_best.pth")
     if os.path.exists(best_model_path):
         print(f"Loading best checkpoint for test: {best_model_path}")
-        model.load_state_dict(torch.load(best_model_path, map_location=config.DEVICE))
+        model.load_state_dict(
+            torch.load(best_model_path, map_location=config.DEVICE), strict=False,
+        )
 
     if test_is_labelled:
         trainer.evaluate_labeled(

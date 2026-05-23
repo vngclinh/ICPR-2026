@@ -57,3 +57,16 @@ def get_val_transforms(img_height: int = 32, img_width: int = 128) -> A.Compose:
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2()
     ], additional_targets=SEQUENCE_TARGETS)
+
+
+def get_hr_transforms(hr_height: int = 64, hr_width: int = 256) -> A.Compose:
+    """Deterministic resize for HR ground truth used as an SR target.
+
+    The SR head emits image-domain floats in [0, 1], so HR targets must stay
+    in the same domain rather than using ImageNet normalization.
+    """
+    return A.Compose([
+        A.Resize(height=hr_height, width=hr_width),
+        A.Normalize(mean=(0.0, 0.0, 0.0), std=(1.0, 1.0, 1.0)),
+        ToTensorV2(),
+    ], additional_targets=SEQUENCE_TARGETS)

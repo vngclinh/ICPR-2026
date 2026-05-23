@@ -1,0 +1,13 @@
+Ep 1/30: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 563/563 [11:17<00:00,  1.20s/it, loss=2.56, lr=3.43e-5]
+Traceback (most recent call last):
+  File "C:\Users\OS\AppData\Local\Programs\Python\Python310\lib\multiprocessing\queues.py", line 244, in _feed
+    obj = _ForkingPickler.dumps(obj)
+  File "C:\Users\OS\AppData\Local\Programs\Python\Python310\lib\multiprocessing\reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+  File "C:\Users\OS\Downloads\ICPR-2026\MultiFrame-LPR\.venv\lib\site-packages\torch\multiprocessing\reductions.py", line 604, in reduce_storage
+    metadata = storage._share_filename_cpu_()
+  File "C:\Users\OS\Downloads\ICPR-2026\MultiFrame-LPR\.venv\lib\site-packages\torch\storage.py", line 449, in wrapper
+    return fn(self, *args, **kwargs)
+  File "C:\Users\OS\Downloads\ICPR-2026\MultiFrame-LPR\.venv\lib\site-packages\torch\storage.py", line 528, in _share_filename_cpu_
+    return super()._share_filename_cpu_(*args, **kwargs)
+RuntimeError: Couldn't open shared file mapping: <torch_27704_3079905057_18>, error code: <1455>

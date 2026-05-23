@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from src.data.transforms import (
     get_degradation_transforms,
+    get_hr_transforms,
     get_light_transforms,
     get_train_transforms,
     get_val_transforms,
@@ -49,6 +50,9 @@ class MultiFrameDataset(Dataset):
         augmentation_level: str = "full",
         is_test: bool = False,
         full_train: bool = False,
+        load_hr: bool = False,
+        hr_height: int = 64,
+        hr_width: int = 256,
     ):
         """
         Args:
@@ -63,6 +67,9 @@ class MultiFrameDataset(Dataset):
             augmentation_level: ``full`` or ``light`` training augmentation.
             is_test: If True, load tracks without requiring annotations.
             full_train: If True, use all labelled tracks for training.
+            load_hr: If True, load optional ``hr-*.png`` frames for SR loss.
+            hr_height: Target HR tensor height.
+            hr_width: Target HR tensor width.
         """
         if mode not in {"train", "val", "test"}:
             raise ValueError(f"Unsupported dataset mode: {mode}")
@@ -78,6 +85,10 @@ class MultiFrameDataset(Dataset):
         self.augmentation_level = augmentation_level
         self.is_test = is_test
         self.full_train = full_train
+        self.load_hr = load_hr
+        self.hr_height = hr_height
+        self.hr_width = hr_width
+        self.hr_transform = get_hr_transforms(hr_height, hr_width) if load_hr else None
 
         if mode == "train":
             self.transform = (
@@ -228,10 +239,12 @@ class MultiFrameDataset(Dataset):
 
             track_id = self._track_key(track_path)
             lr_files = self._image_files(track_path, "lr")
+            hr_files = self._image_files(track_path, "hr")
             if lr_files:
                 self.samples.append(
                     {
                         "paths": lr_files,
+                        "hr_paths": hr_files,
                         "label": label,
                         "is_synthetic": False,
                         "track_id": track_id,
@@ -240,11 +253,11 @@ class MultiFrameDataset(Dataset):
             else:
                 skipped_without_frames += 1
 
-            hr_files = self._image_files(track_path, "hr")
             if include_synthetic and hr_files:
                 self.samples.append(
                     {
                         "paths": hr_files,
+                        "hr_paths": hr_files,
                         "label": label,
                         "is_synthetic": True,
                         "track_id": track_id,
@@ -265,6 +278,7 @@ class MultiFrameDataset(Dataset):
             self.samples.append(
                 {
                     "paths": lr_files,
+                    "hr_paths": self._image_files(track_path, "hr"),
                     "label": "",
                     "is_synthetic": False,
                     "track_id": self._track_key(track_path),
@@ -280,7 +294,62 @@ class MultiFrameDataset(Dataset):
             return img_paths[: self.REQUIRED_FRAMES]
         return img_paths + [img_paths[-1]] * (self.REQUIRED_FRAMES - len(img_paths))
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int, str, str]:
+    def _load_hr_tensor(self, hr_paths: List[str]) -> Tuple[torch.Tensor, bool]:
+        """Load clean HR frames as an SR target tensor [5, 3, hr_h, hr_w].
+
+        Returns (hr_tensor, has_hr). If HR files are missing or loading is disabled
+        a zeros tensor with the correct shape is returned and has_hr=False.
+        """
+        zeros = torch.zeros(
+            self.REQUIRED_FRAMES, 3, self.hr_height, self.hr_width,
+            dtype=torch.float32,
+        )
+        if not self.load_hr or self.hr_transform is None or not hr_paths:
+            return zeros, False
+
+        paths = self._normalize_frame_count(hr_paths)
+        images: List[np.ndarray] = []
+        max_h, max_w = 0, 0
+        for path in paths:
+            image = cv2.imread(path, cv2.IMREAD_COLOR)
+            if image is None:
+                return zeros, False
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w = image.shape[:2]
+            max_h, max_w = max(max_h, h), max(max_w, w)
+            images.append(image)
+
+        padded: List[np.ndarray] = []
+        for image in images:
+            h, w = image.shape[:2]
+            if h != max_h or w != max_w:
+                image = cv2.copyMakeBorder(
+                    image, 0, max_h - h, 0, max_w - w, cv2.BORDER_REPLICATE,
+                )
+            padded.append(image)
+
+        transformed = self.hr_transform(
+            image=padded[0],
+            image1=padded[1],
+            image2=padded[2],
+            image3=padded[3],
+            image4=padded[4],
+        )
+        hr_tensor = torch.stack(
+            [
+                transformed["image"],
+                transformed["image1"],
+                transformed["image2"],
+                transformed["image3"],
+                transformed["image4"],
+            ],
+            dim=0,
+        )
+        return hr_tensor, True
+
+    def __getitem__(
+        self, idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, str, str, torch.Tensor, bool]:
         item = self.samples[idx]
         img_paths = self._normalize_frame_count(item["paths"])
         label = item["label"]
@@ -342,18 +411,46 @@ class MultiFrameDataset(Dataset):
             if not target:
                 target = [0]
 
-        return images_tensor, torch.tensor(target, dtype=torch.long), len(target), label, track_id
+        hr_tensor, has_hr = self._load_hr_tensor(item.get("hr_paths", []))
+
+        return (
+            images_tensor,
+            torch.tensor(target, dtype=torch.long),
+            len(target),
+            label,
+            track_id,
+            hr_tensor,
+            has_hr,
+        )
 
     @staticmethod
     def collate_fn(
-        batch: List[Tuple[torch.Tensor, torch.Tensor, int, str, str]]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[str, ...], Tuple[str, ...]]:
-        """Custom collate function for variable-length CTC targets."""
-        images, targets, target_lengths, labels_text, track_ids = zip(*batch)
+        batch: List[Tuple[torch.Tensor, torch.Tensor, int, str, str, torch.Tensor, bool]]
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Tuple[str, ...],
+        Tuple[str, ...],
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Custom collate function for variable-length CTC targets and optional HR."""
+        (
+            images,
+            targets,
+            target_lengths,
+            labels_text,
+            track_ids,
+            hr_frames,
+            has_hr_flags,
+        ) = zip(*batch)
         return (
             torch.stack(images, 0),
             torch.cat(targets),
             torch.tensor(target_lengths, dtype=torch.long),
             labels_text,
             track_ids,
+            torch.stack(hr_frames, 0),
+            torch.tensor(has_hr_flags, dtype=torch.bool),
         )

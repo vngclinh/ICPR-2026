@@ -48,6 +48,25 @@ class Config:
     TRANSFORMER_LAYERS: int = 3
     TRANSFORMER_FF_DIM: int = 2048
     TRANSFORMER_DROPOUT: float = 0.1
+
+    # Super-resolution (RRDB) frontend
+    USE_SR: bool = True
+    SR_NUM_BLOCKS: int = 8
+    SR_SCALE: int = 2
+    SR_NF: int = 32
+    SR_GC: int = 16
+    SR_FEED_HR: bool = False
+    SR_BLEND: float = 1.0  # 0 = original LR, 1 = full SR enhancement
+    LAMBDA_SR: float = 0.1
+    SR_FREEZE_EPOCHS: int = 2  # epochs to keep RRDB frozen at start
+    OCR_FREEZE_EPOCHS: int = 0  # epochs to keep OCR frozen (SR-only training phase)
+    SR_BASELINE_VAL_ACC: float = 77.2
+    SR_WARNING_EPOCH: int = 5
+    HR_HEIGHT: int = 64
+    HR_WIDTH: int = 256
+    SCHEDULER: str = "onecycle"
+    SR_LR: float | None = None  # separate LR for SR module; None = use LEARNING_RATE
+    TENSORBOARD_LOG_DIR: str | None = None
     
     DEVICE: torch.device = field(default_factory=lambda: torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     OUTPUT_DIR: str = "results"

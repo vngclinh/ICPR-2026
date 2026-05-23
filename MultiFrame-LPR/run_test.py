@@ -22,6 +22,17 @@ from src.utils.common import seed_everything
 from src.utils.postprocess import decode_with_confidence
 
 
+def parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "t", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "f", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run test evaluation/inference")
     parser.add_argument(
@@ -46,6 +57,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--no-stn", action="store_true", help="Disable STN alignment")
+    parser.add_argument("--no-sr", action="store_true", help="Disable the SR frontend")
+    parser.add_argument(
+        "--sr-feed-hr",
+        action="store_true",
+        help="Feed the 2x SR output directly to STN/ResNet instead of downsampling.",
+    )
+    parser.add_argument(
+        "--sr-blend",
+        type=float,
+        default=None,
+        help="Blend factor for SR OCR input: 0 uses original LR, 1 uses full SR output.",
+    )
+    parser.add_argument(
+        "--use_sr", "--use-sr",
+        dest="use_sr",
+        nargs="?",
+        const=True,
+        type=parse_bool,
+        default=None,
+        help="Enable the RRDB super-resolution frontend (default: from config)",
+    )
     parser.add_argument(
         "--output-file",
         type=str,
@@ -84,6 +116,13 @@ def build_model(config: Config) -> torch.nn.Module:
             transformer_ff_dim=config.TRANSFORMER_FF_DIM,
             dropout=config.TRANSFORMER_DROPOUT,
             use_stn=config.USE_STN,
+            use_sr=getattr(config, "USE_SR", False),
+            sr_num_blocks=getattr(config, "SR_NUM_BLOCKS", 8),
+            sr_scale=getattr(config, "SR_SCALE", 2),
+            sr_nf=getattr(config, "SR_NF", 32),
+            sr_gc=getattr(config, "SR_GC", 16),
+            sr_feed_hr=getattr(config, "SR_FEED_HR", False),
+            sr_blend=getattr(config, "SR_BLEND", 1.0),
         ).to(config.DEVICE)
 
     return MultiFrameCRNN(
@@ -135,7 +174,8 @@ def evaluate_labelled(
 
     model.eval()
     with torch.no_grad():
-        for images, targets, target_lengths, labels_text, track_ids in tqdm(loader, desc="Testing"):
+        for batch in tqdm(loader, desc="Testing"):
+            images, targets, target_lengths, labels_text, track_ids, _, _ = batch
             images = images.to(config.DEVICE)
             targets = targets.to(config.DEVICE)
             preds = model(images)
@@ -178,7 +218,8 @@ def predict_unlabelled(
     results: List[str] = []
     model.eval()
     with torch.no_grad():
-        for images, _, _, _, track_ids in tqdm(loader, desc="Inferencing"):
+        for batch in tqdm(loader, desc="Inferencing"):
+            images, _, _, _, track_ids, _, _ = batch
             images = images.to(config.DEVICE)
             preds = model(images)
             decoded_list = decode_with_confidence(preds, config.IDX2CHAR)
@@ -203,6 +244,14 @@ def main() -> None:
         config.NUM_WORKERS = args.num_workers
     if args.no_stn:
         config.USE_STN = False
+    if args.use_sr is not None:
+        config.USE_SR = bool(args.use_sr)
+    if args.no_sr:
+        config.USE_SR = False
+    if args.sr_feed_hr:
+        config.SR_FEED_HR = True
+    if args.sr_blend is not None:
+        config.SR_BLEND = args.sr_blend
 
     seed_everything(config.SEED)
 
@@ -216,6 +265,9 @@ def main() -> None:
     print("Test configuration:")
     print(f"   DATA: {config.TEST_DATA_ROOT}")
     print(f"   MODEL: {config.MODEL_TYPE}")
+    print(f"   USE_SR: {getattr(config, 'USE_SR', False)} | "
+          f"feed_hr={getattr(config, 'SR_FEED_HR', False)} | "
+          f"blend={getattr(config, 'SR_BLEND', 1.0)}")
     print(f"   CHECKPOINT: {args.checkpoint}")
     print(f"   DEVICE: {config.DEVICE}")
 
@@ -234,7 +286,12 @@ def main() -> None:
     )
 
     model = build_model(config)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=config.DEVICE))
+    state_dict = torch.load(args.checkpoint, map_location=config.DEVICE)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"Checkpoint missing {len(missing)} keys (initialized fresh).")
+    if unexpected:
+        print(f"Checkpoint had {len(unexpected)} unexpected keys (ignored).")
     print("Weights loaded.")
 
     if is_labelled:
