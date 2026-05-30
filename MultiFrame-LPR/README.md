@@ -1,232 +1,162 @@
 # MultiFrame-LPR
 
-Multi-frame OCR solution for the **ICPR 2026 Challenge on Low-Resolution License Plate Recognition**.
+Multi-frame OCR solution cho **ICPR 2026 Low-Resolution License Plate Recognition Challenge**. Pipeline xử lý 5 frame liên tiếp cho mỗi biển số, kết hợp SVTR/ResNet backbones, factorized temporal attention, dual CTC/Attention decoder heads, và ensemble 4 kiến trúc khác nhau.
 
-This implementation combines temporal information from 5 video frames using attention fusion mechanisms to achieve robust recognition on low-resolution license plates.
+🔗 [Challenge homepage](https://icpr26lrlpr.github.io/)
 
-🔗 **Challenge:** [ICPR 2026 LRLPR](https://icpr26lrlpr.github.io/)
+📄 **Báo cáo chi tiết:** xem [REPORT.md](REPORT.md) — tổng kết toàn bộ các kỹ thuật đã thử nghiệm, so sánh kết quả, và các bài học engineering.
 
 ---
 
-## Quick Start
+## Kết quả
+
+| Pipeline | Test acc | Δ vs baseline |
+|---|---|---|
+| 1 — ResTran + RRDB SR | 73.00% | — |
+| 2 — ICPR2026 ensemble 5-way (V1-V5) | 76.93% | +3.93 |
+| **3 — Multi-architecture ensemble 4-way** ⭐ | **78.73%** | **+5.73** |
+| Mục tiêu | 80.00% | |
+
+**File submission cuối cùng:** `results/submission_4way_ensemble.txt`
+
+---
+
+## Quick Start (reproduce 78.73% test acc)
 
 ```bash
 # Install dependencies
 uv sync
 
-# Train with default settings (ResTranOCR + STN)
-python train.py
+# Data structure: data/LRLPR-26-5opEvJTW/{train/Scenario-{A,B}, test}/
 
-# Verify dataset/model wiring without training
-python train.py --dry-run --batch-size 2 --num-workers 0
+# 1. Train 4 multi-arch models (~4h total trên RTX 4060 8GB)
+python train_multi_arch.py -n multi_svtr     -m svtr     --epochs 25 --batch-size 48 --lr 5e-4
+python train_multi_arch.py -n multi_new_svtr -m new_svtr --epochs 25 --batch-size 32 --lr 5e-4
+python train_multi_arch.py -n multi_restran  -m restran  --epochs 25 --batch-size 16 --lr 2e-4 --no-sr
+python train_multi_arch.py -n multi_crnn     -m crnn     --epochs 25 --batch-size 48 --lr 3e-4
 
-# Train CRNN baseline
-python train.py --model crnn --experiment-name crnn_baseline
+# 2. Ensemble eval trên labelled test set
+python eval_multi_arch.py \
+  --ckpt svtr=results/multi_svtr_best.pth \
+  --ckpt new_svtr=results/multi_new_svtr_best.pth \
+  --ckpt restran=results/multi_restran_best.pth \
+  --ckpt crnn=results/multi_crnn_best.pth \
+  --min-agree 2 --mode test_labeled
 
-# Train with train/val split and evaluate released labelled test
-python train.py --model restran
+# 3. Generate competition submission
+python eval_multi_arch.py \
+  --ckpt svtr=results/multi_svtr_best.pth \
+  --ckpt new_svtr=results/multi_new_svtr_best.pth \
+  --ckpt restran=results/multi_restran_best.pth \
+  --ckpt crnn=results/multi_crnn_best.pth \
+  --min-agree 2 --mode test --output results/submission_final.txt
 ```
 
 ---
 
-## Key Features
+## Pipelines available
 
-- **Multi-Frame Fusion**: Processes 5-frame sequences with attention-based fusion
-- **Spatial Transformer Network**: Optional STN module for automatic image alignment
-- **Dual Architectures**: CRNN (baseline) and ResTranOCR (ResNet34 + Transformer)
-- **Smart Data Augmentation**: reproducible train/val split with configurable augmentation levels
-- **Production Ready**: Mixed precision training, gradient clipping, OneCycleLR scheduler
+Project chứa **3 pipelines song song**, mỗi pipeline có entrypoint riêng.
 
----
+### Pipeline 3 — Multi-architecture ensemble (BEST — 78.73% test)
 
-## Model Architectures
-
-### CRNN (Baseline)
-**Pipeline:** Multi-frame Input → STN Alignment → CNN → Attention Fusion → BiLSTM → CTC
-
-Simple and effective baseline using convolutional features and bidirectional LSTM for sequence modeling.
-
-### ResTranOCR (Advanced)
-**Pipeline:** Multi-frame Input → STN Alignment → ResNet34 → Attention Fusion → Transformer → CTC
-
-Modern architecture leveraging ResNet34 backbone and Transformer encoder with positional encoding for improved long-range dependencies.
-
-**Both models accept input shape:** `(Batch, 5, 3, 32, 128)` and output character sequences via CTC decoding.
-
----
-
-## Installation
-
-**Requirements:**
-- Python 3.11+
-- CUDA-enabled GPU (recommended)
-
-**Using uv (recommended):**
-```bash
-git clone https://github.com/duongtruongbinh/MultiFrame-LPR.git
-cd MultiFrame-LPR
-uv sync
-```
-
-**Using pip:**
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-pip install albumentations opencv-python matplotlib numpy pandas tqdm
-```
-
----
-
-## Usage
-
-### Data Preparation
-
-Default paths target the released dataset:
-
-```text
-data/LRLPR-26-5opEvJTW/train
-data/LRLPR-26-5opEvJTW/test
-```
-
-`train.py` splits the released `train` folder into train/val and evaluates the labelled released `test` folder after training.
-
-Organize your dataset with the following structure:
-
-```
-data/LRLPR-26-5opEvJTW/train/
-├── track_001/
-│   ├── lr-001.png
-│   ├── lr-002.png
-│   ├── ...
-│   ├── hr-001.png (optional, for synthetic LR generation)
-│   └── annotations.json
-└── track_002/
-    └── ...
-```
-
-**annotations.json format:**
-```json
-{"plate_text": "ABC1234"}
-```
-
-### Training
-
-**Basic training:**
-```bash
-python train.py
-```
-
-**Custom configuration:**
-```bash
-python train.py \
-    --model restran \
-    --experiment-name my_experiment \
-    --data-root /path/to/dataset \
-    --batch-size 64 \
-    --epochs 30 \
-    --lr 0.0005 \
-    --aug-level full
-```
-
-**Disable STN:**
-```bash
-python train.py --no-stn
-```
-
-**Key arguments:**
-- `-m, --model`: Model type (`crnn` or `restran`)
-- `-n, --experiment-name`: Experiment identifier
-- `--data-root`: Path to training data (default: `data/LRLPR-26-5opEvJTW/train`)
-- `--batch-size`: Batch size (default: 64)
-- `--epochs`: Training epochs (default: 30)
-- `--lr`: Learning rate (default: 5e-4)
-- `--aug-level`: Augmentation level (`full` or `light`)
-- `--no-stn`: Disable Spatial Transformer Network
-- `--submission-mode`: Train on the full released train split and run test inference/evaluation
-- `--output-dir`: Output directory (default: `results/`)
-
-### Ablation Studies
-
-Run automated experiments comparing different configurations:
+Ensemble 4 kiến trúc khác nhau, mỗi model có training recipe + loss schedule khác nhau, gộp bằng smart majority voting.
 
 ```bash
-python run_ablation.py
+python train_multi_arch.py -m {svtr,new_svtr,restran,crnn} -n my_exp [--epochs 25 ...]
+python eval_multi_arch.py --ckpt v1=... --mode {val,test_labeled,test}
 ```
 
-Experiments:
-- CRNN with/without STN
-- ResTranOCR with/without STN
+4 architectures:
+- **svtr**: TPS + SVTR backbone + TemporalFusion + **dual CTC/Attention head** (best single: 77.37% test)
+- **new_svtr**: STN + SVTR (256ch) + FactorizedTempAttn + SR head (76.47% test)
+- **restran**: STN + ResNet34 + FactorizedTempAttn (72.73% test)
+- **crnn**: STN + CNN + BiLSTM — kiến trúc khác biệt nhất → tăng diversity ensemble (72.17% test)
 
-Results saved in `experiments/ablation_summary.txt`.
+Files: `src/models/multi_arch/`, `train_multi_arch.py`, `eval_multi_arch.py`
 
-### Outputs
+### Pipeline 2 — ICPR2026 custom (V1-V5 — 76.93% test ensemble)
 
-After training, the following files are generated in the output directory:
+5 variants với SE-ResNet34-C backbone, khác nhau ở vị trí multi-frame fusion và decoder.
 
-- `{experiment_name}_best.pth` - Best model checkpoint
-- `submission_{experiment_name}.txt` - Predictions in competition format: `track_id,predicted_text;confidence`
-- `test_predictions_{experiment_name}.csv` - Released test predictions with ground truth, confidence, and correctness
+```bash
+python train_icpr2026.py --variant {v1,v2,v3,v4,v5} [--epochs 25 ...]
+python eval_icpr2026.py --variant v1 --ckpt results/icpr2026_v1_best.pth --eval-test-labeled
+python eval_icpr2026_ensemble_v2.py --ckpt v1=... --ckpt v2=... --mode test_labeled
+```
+
+Files: `src/models/{se_resnet34c,svtr,lpr_*}.py`, `src/models/lpr_variants.py`
+
+### Pipeline 1 — Legacy ResTran + RRDB SR (baseline — 73.00% test)
+
+Pipeline ban đầu với ResNet34 + AttentionFusion + RRDB super-resolution.
+
+```bash
+python train.py --model {restran,crnn} [-n my_exp]
+```
+
+Files: `src/models/{restran,crnn,components,sr_model}.py`
 
 ---
 
-## Configuration
+## Dataset format
 
-Key hyperparameters in `configs/config.py`:
-
-```python
-MODEL_TYPE = "restran"           # "crnn" or "restran"
-USE_STN = True                   # Enable/disable STN
-BATCH_SIZE = 64
-LEARNING_RATE = 5e-4
-EPOCHS = 30
-AUGMENTATION_LEVEL = "full"      # "full" or "light"
-
-# CRNN specific
-HIDDEN_SIZE = 256
-RNN_DROPOUT = 0.25
-
-# ResTranOCR specific
-TRANSFORMER_HEADS = 8
-TRANSFORMER_LAYERS = 3
-TRANSFORMER_FF_DIM = 2048
-TRANSFORMER_DROPOUT = 0.1
+```
+data/LRLPR-26-5opEvJTW/
+├── train/
+│   ├── Scenario-A/
+│   │   └── <layout>/track_*/lr-*.{png,jpg}  (+ hr-*.png + annotations.json)
+│   └── Scenario-B/...
+└── test/track_*/lr-*.{png,jpg}  (+ annotations.json)
 ```
 
-All config parameters can be overridden via CLI arguments.
+**annotations.json:** `{"plate_text": "ABC1234"}` (7 ký tự, Brazil-old hoặc Mercosur).
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
-.
-├── configs/
-│   └── config.py              # Configuration dataclass
-├── src/
-│   ├── data/
-│   │   ├── dataset.py         # MultiFrameDataset with scenario-aware splitting
-│   │   └── transforms.py      # Augmentation pipelines
-│   ├── models/
-│   │   ├── crnn.py            # CRNN baseline
-│   │   ├── restran.py         # ResTranOCR advanced model
-│   │   └── components.py      # Shared modules (STN, AttentionFusion, etc.)
-│   ├── training/
-│   │   └── trainer.py         # Training loop and validation
-│   └── utils/
-│       ├── common.py          # Utility functions
-│       └── postprocess.py     # CTC decoding
-├── train.py                   # Main training script
-├── run_ablation.py            # Ablation study automation
-└── pyproject.toml             # Dependencies
+configs/                  Config dataclasses (3 pipelines)
+src/
+├── data/                 MultiFrameDataset + augmentation
+├── models/
+│   ├── components.py restran.py crnn.py sr_model.py  Pipeline 1
+│   ├── lpdiff/                                       LP-Diff (abandoned)
+│   ├── se_resnet34c.py svtr.py lpr_*.py              Pipeline 2 modules
+│   ├── lpr_variants.py                               Pipeline 2: V1-V5 assembly
+│   └── multi_arch/                                   Pipeline 3 (BEST)
+│       ├── components.py svtr.py new_svtr.py restran.py crnn.py mamba.py
+│       └── trainer.py
+├── losses/               Pipeline 2 multi-loss modules
+├── inference/            Ensemble + format-constrained decoding
+├── training/             Trainers cho Pipeline 1 + 2
+└── utils/
+
+train.py                  Pipeline 1
+train_icpr2026.py         Pipeline 2
+train_multi_arch.py       Pipeline 3 (BEST)
+train_lpdiff.py           LP-Diff (abandoned)
+
+eval_icpr2026.py                Per-variant eval cho Pipeline 2
+eval_icpr2026_ensemble_v2.py    Pipeline 2 ensemble
+eval_multi_arch.py              Pipeline 3 ensemble (BEST)
+run_ensemble.py                 Legacy ensemble (Pipeline 1 variants)
+
+archive/                  Experimental scripts
+logs/                     Training logs
+results/                  Checkpoints + submissions
+REPORT.md                 Comprehensive technical report
 ```
 
 ---
 
-## Technical Details
+## Hardware
 
-### Attention Fusion Module
-Dynamically computes attention weights across temporal frames and fuses multi-frame features into a single representation before sequence modeling.
+Đã verify trên **RTX 4060 Laptop 8GB VRAM** (Windows 11). Batch sizes đã tinh chỉnh để fit. CPU-only inference work nhưng chậm (~50× slower).
 
-### Data Augmentation
-- **Full mode**: Affine transforms, perspective warping, HSV adjustment, coarse dropout
-- **Light mode**: Resize and normalize only
-- **Released split support**: Validation is sampled reproducibly from the released `train` folder and `test` is evaluated separately
+---
+
+## Documentation
+
+- **[REPORT.md](REPORT.md)** — Báo cáo tổng kết: kiến trúc, thí nghiệm, so sánh kết quả 3 pipelines, bài học engineering

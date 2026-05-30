@@ -53,6 +53,8 @@ class MultiFrameDataset(Dataset):
         load_hr: bool = False,
         hr_height: int = 64,
         hr_width: int = 256,
+        use_sr_cache: bool = False,
+        sr_prefix: str = "sr",
     ):
         """
         Args:
@@ -70,6 +72,10 @@ class MultiFrameDataset(Dataset):
             load_hr: If True, load optional ``hr-*.png`` frames for SR loss.
             hr_height: Target HR tensor height.
             hr_width: Target HR tensor width.
+            use_sr_cache: If True, prefer ``sr_prefix``-prefixed files (e.g.
+                ``sr-001.png``) over the raw ``lr-*`` frames. Used after running
+                ``gen_sr_images.py`` to feed OCR on LP-Diff outputs.
+            sr_prefix: Filename prefix for the cached SR frames. Default "sr".
         """
         if mode not in {"train", "val", "test"}:
             raise ValueError(f"Unsupported dataset mode: {mode}")
@@ -89,6 +95,8 @@ class MultiFrameDataset(Dataset):
         self.hr_height = hr_height
         self.hr_width = hr_width
         self.hr_transform = get_hr_transforms(hr_height, hr_width) if load_hr else None
+        self.use_sr_cache = use_sr_cache
+        self.sr_prefix = sr_prefix
 
         if mode == "train":
             self.transform = (
@@ -231,6 +239,8 @@ class MultiFrameDataset(Dataset):
         skipped_without_label = 0
         skipped_without_frames = 0
 
+        sr_used = 0
+        sr_missing = 0
         for track_path in tqdm(tracks, desc=f"Indexing {self.mode}"):
             label = self._read_label(track_path)
             if not label:
@@ -240,6 +250,13 @@ class MultiFrameDataset(Dataset):
             track_id = self._track_key(track_path)
             lr_files = self._image_files(track_path, "lr")
             hr_files = self._image_files(track_path, "hr")
+            if self.use_sr_cache:
+                sr_files = self._image_files(track_path, self.sr_prefix)
+                if sr_files:
+                    lr_files = sr_files
+                    sr_used += 1
+                else:
+                    sr_missing += 1
             if lr_files:
                 self.samples.append(
                     {
@@ -268,11 +285,18 @@ class MultiFrameDataset(Dataset):
             print(f"WARNING: skipped {skipped_without_label} tracks without labels.")
         if skipped_without_frames:
             print(f"WARNING: skipped {skipped_without_frames} labelled tracks without LR frames.")
+        if self.use_sr_cache:
+            print(f"SR cache: used '{self.sr_prefix}-*' on {sr_used} tracks; "
+                  f"fell back to 'lr-*' on {sr_missing} tracks.")
 
     def _index_unlabeled_samples(self, tracks: List[str]) -> None:
         """Index tracks for submission/inference when labels are unavailable."""
         for track_path in tqdm(tracks, desc="Indexing test"):
             lr_files = self._image_files(track_path, "lr")
+            if self.use_sr_cache:
+                sr_files = self._image_files(track_path, self.sr_prefix)
+                if sr_files:
+                    lr_files = sr_files
             if not lr_files:
                 continue
             self.samples.append(
